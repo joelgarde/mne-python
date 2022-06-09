@@ -842,6 +842,18 @@ def _fit_eval(rd, B, B2, fwd_svd=None, fwd_data=None, whitener=None,
     return 1. - gof
 
 
+def _fit_eval_polar(fast_tri_fn, rd, B, B2, fwd_svd=None, fwd_data=None, whitener=None,
+              lwork=None):
+    """Calculate the residual sum of squares from spheric coordinates."""
+    from utils.geometric import carthesian
+    surf  = fwd_data['inner_skull']
+    rr, tri = surf['rr'], surf['tri']
+    tri, barycoo = fast_tri_fn(carthesian(np.atleast_2d(rd)))
+    rd = rr[tri].T @ barycoo
+    return _fit_eval(rd, B, B2, fwd_svd=fwd_svd, fwd_data=fwd_data, whitener=whitener, lwork=lwork)
+
+
+
 @functools.lru_cache(None)
 def _get_ddot_dgemv_dgemm():
     return _get_blas_funcs(np.float64, ('dot', 'gemv', 'gemm'))
@@ -1095,6 +1107,67 @@ def _sphere_constraint(rd, r0, R_adj):
     """Sphere fitting constraint."""
     return R_adj - np.sqrt(np.sum((rd - r0) ** 2))
 
+def _fit_dipole_polar(min_dist_to_inner_skull, B_orig, t, guess_rrs,
+                guess_data, fwd_data, whitener, fmin_cobyla, ori, rank,
+                rhoend):
+    """Fit a single bit of data."""
+    from utils.geometric import polar, carthesian
+
+    B = np.dot(whitener, B_orig)
+
+    # make constraint function to keep the solver within the inner skull
+    if 'rr' in fwd_data['inner_skull']:  # bem
+        surf = fwd_data['inner_skull']
+        tri = surf['tri']
+        rr = surf['rr']
+        sphere_rr = surf['rr']
+        from utils.geometric import make_find_tri
+        fast_tri = make_find_tri(sphere_rr, tri)
+
+
+    else:
+        raise NotImplemented("only implemented for the mesh model.")
+
+    # Find a good starting point (find_best_guess in C)
+    B2 = np.dot(B, B)
+    if B2 == 0:
+        warn('Zero field found for time %s' % t)
+        return np.zeros(3), 0, np.zeros(3), 0, B
+
+    idx = np.argmin([_fit_eval(guess_rrs[[fi], :], B, B2, fwd_svd)
+                     for fi, fwd_svd in enumerate(guess_data['fwd_svd'])])
+    x0 = guess_rrs[idx]
+    x0 = polar(x0)[...,1:]
+    lwork = _svd_lwork((3, B.shape[0]))
+    fun = partial(_fit_eval_polar, fast_tri_fn=fast_tri, B=B, B2=B2, fwd_data=fwd_data, whitener=whitener,
+                  lwork=lwork)
+
+    from scipy.optimize import minimize
+    rd_final = minimize(fun, x0, method="Nelder-Mead", bounds=((0, np.pi), (-np.pi, np.pi)),  options=dict(xatol=rhoend,))
+    tri_final, bary_final = fast_tri(carthesian(rd_final))
+    rd_final = rr[tri[tri_final]].T @ bary_final
+
+    # Compute the dipole moment at the final point
+    Q, gof, residual_noproj, n_comp = _fit_Q(
+        fwd_data, whitener, B, B2, B_orig, rd_final, ori=ori)
+    khi2 = (1 - gof) * B2
+    nfree = rank - n_comp
+    amp = np.sqrt(np.dot(Q, Q))
+    norm = 1. if amp == 0. else amp
+    ori = Q / norm
+
+    conf = _fit_confidence(rd_final, Q, ori, whitener, fwd_data)
+
+    msg = '---- Fitted : %7.1f ms' % (1000. * t)
+    if surf is not None:
+        dist_to_inner_skull = _compute_nearest(
+            surf['rr'], rd_final[np.newaxis, :], return_dists=True)[1][0]
+        msg += (", distance to inner skull : %2.4f mm"
+                % (dist_to_inner_skull * 1000.))
+
+    logger.info(msg)
+    return rd_final, amp, ori, gof, conf, khi2, nfree, residual_noproj
+
 
 def _fit_dipole(min_dist_to_inner_skull, B_orig, t, guess_rrs,
                 guess_data, fwd_data, whitener, fmin_cobyla, ori, rank,
@@ -1346,7 +1419,7 @@ def fit_dipole(evoked, cov, bem, trans=None, min_dist=5., n_jobs=None,
         if ori is not None:
             ori = np.array(ori, float)
             if ori.shape != (3,):
-                raise ValueError('oris must be None or a 3-element array-like,'
+                raise ValueError('oris must be Nonefit_di or a 3-element array-like,'
                                  ' got %s' % (ori,))
             norm = np.sqrt(np.sum(ori * ori))
             if not np.isclose(norm, 1):
@@ -1411,7 +1484,7 @@ def fit_dipole(evoked, cov, bem, trans=None, min_dist=5., n_jobs=None,
     # n_chan = len(info_nb['ch_names'])
     # whitener = np.zeros((n_chan, n_chan), dtype=np.float64)
     # whitener[nzero, nzero] = 1.0 / np.sqrt(cov['eig'][nzero])
-    # whitener = np.dot(whitener, cov['eigvec'])
+    # whitener = np.dot(whitener, cov['eigvec'])20_
 
     whitener, _, rank = compute_whitener(cov, info, picks=picks,
                                          rank=rank, return_rank=True)
