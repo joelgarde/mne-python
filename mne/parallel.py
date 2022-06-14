@@ -62,6 +62,7 @@ def parallel_func(func, n_jobs, max_nbytes='auto', pre_dispatch='n_jobs',
     should_print = (logger.level <= logging.INFO)
     # for a single job, we don't need joblib
     _validate_type(n_jobs, ('int-like', None))
+
     if n_jobs != 1:
         try:
             from joblib import Parallel, delayed
@@ -69,7 +70,7 @@ def parallel_func(func, n_jobs, max_nbytes='auto', pre_dispatch='n_jobs',
             if n_jobs is not None:
                 warn('joblib not installed. Cannot run in parallel.')
             n_jobs = 1
-    if n_jobs == 1:
+    if n_jobs == 1 or max_jobs == 1:
         n_jobs = 1
         my_func = func
         parallel = list
