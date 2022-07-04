@@ -1,4 +1,6 @@
 from functools import partial
+import logging
+from mne.bem import _fit_sphere
 
 import numpy as np
 from numpy.typing import ArrayLike
@@ -6,14 +8,7 @@ from numpy.typing import ArrayLike
 vnorm = partial(np.linalg.norm, axis=-1, ord=2)
 vcross = partial(np.cross, axis=-1)
 
-def make_find_tri(rr: ArrayLike, tri: ArrayLike):
-    tree = tri_KDTree(rr, tri)
-    def find_tri_tree(x):
-        """fast point to intersecting triangle using a KDTree."""
-        idx = tree(x)
-        tri_idx, tri_coo = find_tri(x, rr, tri[idx])
-        return idx[tri_idx], tri_coo
-    return find_tri_tree
+
 
 def carthesian(a: ArrayLike, ρ=0.1):
     """converts a to carthesian coordiantes."""
@@ -23,6 +18,7 @@ def carthesian(a: ArrayLike, ρ=0.1):
         θ, φ = a.T
     else:
         ρ, θ, φ = a.T
+    θ = (np.pi /2) - θ
     cos_θ = np.cos(θ)
     cos_φ = np.cos(φ)
     sin_θ = np.sin(θ)
@@ -32,13 +28,14 @@ def carthesian(a: ArrayLike, ρ=0.1):
     z = ρ * cos_θ
     return np.c_[x, y, z].squeeze()
 
+
 def polar(a: ArrayLike):
     """converts x to polar coordinates."""
     a = np.asarray(a)
     x, y, z = a.T
     ρ = vnorm(a)
     rxy = vnorm(a[..., :2])
-    θ = np.arctan2(rxy, z)
+    θ = (np.pi / 2) - np.arctan2(rxy, z)
     φ = np.arctan2(y, x)
     return np.c_[ρ, θ, φ].squeeze()
 
@@ -54,13 +51,12 @@ def find_tri(X: ArrayLike, rr: ArrayLike, tri: ArrayLike):
     tri: (Nt, 3): triangles indices.
     Returns
     -------
-    i: intersected triangle index.
+    m: intersected triangle index.
     t: (3,) coords of the intersection in in i's barycentric system.
     """
 
     # Solve the barycentric system.
-    e = 1e-5
-    X = np.asarray(X)
+    X = np.ravel(X)
     A = rr[tri]
     E1 = A[:, 1] - A[:, 0]
     E2 = A[:, 2] - A[:, 0]
@@ -79,91 +75,54 @@ def find_tri(X: ArrayLike, rr: ArrayLike, tri: ArrayLike):
     return m, t
 
 
+class SphereWhite(dict):
+    """subclassing dict to be considered as a surface by the rest of mne.
+    Points on the sphere are treated using their carthesian coordinates.
+    """
 
-def tri_KDTree(rr: ArrayLike, tri: ArrayLike):
-    """build a KTD tree to find tri close to a point x."""
-    A = rr[tri]
-    E1 = np.linalg.norm(A[:, 0] - A[:, 1], axis=-1)
-    E2 = np.linalg.norm(A[:, 0] - A[:, 2], axis=-1)
-    E3 = np.linalg.norm(A[:, 2] - A[:, 1], axis=-1)
-    E = np.c_[E1, E2, E3]
-    max_tri_lenght = np.max(E)
-    point2tri = np.frompyfunc(list, 0, 1)(np.empty(rr.shape[0], dtype=object))
-    for i, (a, b, c) in enumerate(tri):
-        point2tri[a].append(i)
-        point2tri[b].append(i)
-        point2tri[c].append(i)
-
-    from scipy.spatial import KDTree
-    tree = KDTree(rr, copy_data=True)
-    def find_close(x):
-        """
-
-        Parameters
-        ----------
-        x (3,) point to query
-
-        Returns
-        -------
-        tri: (N,) close triangles.
-        """
-        #pids = tree.query_ball_point(np.atleast_2d(x), r=max_tri_lenght)
-        dd, pids = tree.query(x, k=10)
-        return np.unique([u for i in pids for u in point2tri[i]])
-
-    return find_close
-
-
-
-
-
-class SphereMappedSources(dict):
-
-    @classmethod
-    def from_path(cls, subject_path,  hemisphere="lh",  **setupkwargs):
+    def __init__(self, hemishpere='lh', project=False) -> None:
         from pathlib import Path
-        from mne import setup_source_space
+        from mne.surface import _read_mri_surface
+        from mne.datasets.sample import data_path
+        from scipy.sparse import csr_array
+        from sklearn.neighbors import KDTree
 
-        subject_path = Path(subject_path)
-        subject = subject_path.name
-        subject_dir = subject_path.parent
-        setupkwargs = dict(subjects_dir=subject_dir, add_dist=False, spacing="all") | setupkwargs
-        setup = partial(setup_source_space, subject, **setupkwargs)
+        self.project = project
+        surf_path = Path(data_path()) / 'subjects' / 'sample' / 'surf'
+        white = _read_mri_surface(surf_path / f'{hemishpere}.white')
+        sphere = _read_mri_surface(surf_path / f'{hemishpere}.sphere')
+        self |= white
 
-        white = setup(surface="white")
-        sphere = setup(surface="sphere")
+        radius, origin = _fit_sphere(sphere['rr'])
 
-        idx = 0 if (hemisphere == "lh") else 1
-        white = white[idx]
-        sphere = sphere[idx]
+        logging.info(f'sphere radius, origine: {radius}, {origin}')           
+        u = sphere['rr'] - origin
+        u /= radius
+        self['sph_rr'] = u
+        self.radius = 1.0
+        self.center = 0.0
 
-        sph_rr = sphere['rr']
-        mesh_rr = white['rr']
-        tri = sphere['tris']
+        self.tree = KDTree(self['sph_rr'])
+        points = self['tris'].flatten()
+        tri_idx = np.repeat(np.arange(self['tris'].shape[0]), 3)
+        point2tri = csr_array((tri_idx, (points, tri_idx)), shape=(self['rr'].shape[0], self['tris'].shape[0]))
+        self.point2tri = point2tri
 
-        cull_unused = False
-        if cull_unused:
-            vertno = sphere['vertno']
-            tris = sphere['use_tris'] or sphere['tris']
-            inv_vertno = np.full(sph_rr.shape[0], -1, dtype=np.intc)
-            inv_vertno[vertno] = np.arange(vertno.shape[0])
-            mesh_rr = mesh_rr[vertno]
-            sph_rr = sph_rr[vertno]
-            tri = inv_vertno[tris]
 
-        tree_fn = tri_KDTree(sph_rr, tri)
-        out = cls(id=sphere["id"], coord_frame=white["coord_frame"], rr=mesh_rr, tree_fn=tree_fn, sph_rr=sph_rr, tri=tri)
-        return out
-
-    def transform(self, rd, on='rr'):
-        """ late binding provided by `from_path`
-        (φ,θ) → (x,y,z)
+    def transform(self, rd, on="rr"):
+        """ from sphere point to cortical point.
         """
-        coords = carthesian(rd)
-        idx_leafs = self["tree_fn"](coords)
-        correct_leaf, bary_coo = find_tri(coords, self["sph_rr"], self["tri"][idx_leafs])
-        idx = idx_leafs[correct_leaf]
-        rd = np.einsum("ij,i->j", self[on][self["tri"][idx]], bary_coo)
+        rd = np.atleast_2d(rd)
+        print(rd)
+        if self.project:
+            rd = rd / np.linalg.norm(rd, axis=1).item()
+        leaf = self.tree.query(rd, k=25, sort_results=False, return_distance=False)
+        tri_leaf = np.unique(self.point2tri[leaf[0]].data)
+        intersected_tri, barycentric_coordinates = find_tri(
+            rd, self["sph_rr"], self["tris"][tri_leaf])
+        idx = tri_leaf[intersected_tri]
+        tri = self[on][self["tris"][idx]]
+        rd = np.einsum("ij,i->j", tri, barycentric_coordinates)
         return rd
 
 
@@ -172,51 +131,54 @@ def toMesh(rr, tri):
     mesh = pyvista.PolyData(rr, np.c_[np.full(len(tri), 3), tri])
     return mesh
 
+
 if __name__ == "__main__":
-    """ this si a demo of the sphere <-> cortical mapping.
-    """
+    """this si a demo of the sphere <-> cortical mapping."""
     from pathlib import Path
+
     import pyvista
+
     import mne
+
     np.set_printoptions(precision=2, floatmode="fixed")
-    surfaces_dir: Path = mne.datasets.sample.data_path() / "subjects" / "sample" / "surf"
+    surfaces_dir: Path = (
+        mne.datasets.sample.data_path() / "subjects" / "sample" / "surf"
+    )
     subject_path: Path = mne.datasets.sample.data_path() / "subjects" / "sample"
-
-    sph = SphereMappedSources.from_path(subject_path=subject_path,)
-
+    logging.basicConfig(level=logging.INFO)
+    sph = SphereWhite()
     random = True
     if random:
-        #direct random sampling on the sphere
+        # direct random sampling on the sphere
         from numpy.random import default_rng
+
         rng = default_rng()
         grid = rng.standard_normal((200, 3))
-        inv_norm = 0.1 / np.linalg.norm(grid, axis=1)
-        grid = polar(np.einsum("ij,i->ij", grid, inv_norm))
+        inv_norm = sph.radius / np.linalg.norm(grid, axis=1)
+        grid = np.einsum("ij,i->ij", grid, inv_norm)
     else:
-        #grid on angles points /!\ not uniform on the sphere.
-        grid = np.mgrid[0.1:np.pi:10j, -np.pi:np.pi:10j].reshape((2, -1)).T
+        # grid on angles points /!\ not uniform on the sphere.
+        grid = carthesian(np.mgrid[0.1 : np.pi : 10j, -np.pi : np.pi : 10j].reshape((2, -1)).T)
 
-    assert np.allclose(grid, polar(carthesian(grid)))
+    assert np.allclose(grid, carthesian(polar(grid)))
+
     rd = np.vectorize(partial(sph.transform, on="sph_rr"), signature="(m)->(n)")(grid)
-
-    sphere_mesh = toMesh(sph['sph_rr'], sph['tri'])
+    
+    sphere_mesh = toMesh(sph["sph_rr"], sph["tris"])
     plotter = pyvista.Plotter()
     plotter.add_mesh(sphere_mesh, opacity=0.85, show_edges=True)
-    plotter.add_points(carthesian(grid), color="blue", render_points_as_spheres=True, point_size=10.0)
+    plotter.add_points(
+        grid, color="blue", render_points_as_spheres=True, point_size=10.0
+    )
     plotter.add_points(rd, color="red", render_points_as_spheres=True, point_size=10.0)
-    plotter.add_title("Points sampled on (θ, φ) space, \ntheir carthesian transform (blue) \nand mesh interpolation (red)")
+    plotter.add_title(
+        "Points sampled on (θ, φ) space, \ntheir carthesian transform (blue) \nand mesh interpolation (red)"
+    )
     plotter.show()
 
     rd = np.vectorize(partial(sph.transform, on="rr"), signature="(m)->(n)")(grid)
     plotter = pyvista.Plotter()
-    plotter.add_mesh(toMesh(sph['rr'], sph['tri']), opacity=0.85, show_edges=True)
+    plotter.add_mesh(toMesh(sph["rr"], sph["tris"]), opacity=0.85, show_edges=True)
     plotter.add_points(rd, color="red", render_points_as_spheres=True, point_size=10.0)
-    plotter.add_title(
-        "Points sampled on (θ, φ) space and cortical interpolation.")
+    plotter.add_title("Points sampled on (θ, φ) space and cortical interpolation.")
     plotter.show()
-
-
-
-
-
-

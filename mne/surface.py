@@ -575,12 +575,10 @@ def _points_outside_surface(rr, surf, n_jobs=None, verbose=None):
 def _surface_to_polydata(surf):
     import pyvista as pv
     vertices = np.array(surf['rr'])
-    if 'tris' not in surf:
-        return pv.PolyData(vertices)
-    else:
-        triangles = np.array(surf['tris'])
+    triangles = surf.get('use_tris') if 'use_tris' in surf else surf.get('tris')
+    if triangles is not None:
         triangles = np.c_[np.full(len(triangles), 3), triangles]
-        return pv.PolyData(vertices, triangles)
+    return pv.PolyData(vertices, triangles)
 
 
 def _polydata_to_surface(pd, normals=True):

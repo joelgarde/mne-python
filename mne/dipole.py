@@ -5,18 +5,13 @@
 #          Eric Larson <larson.eric.d@gmail.com>
 #
 # License: Simplified BSD
-import logging
 from copy import deepcopy
 import functools
 from functools import partial
 import re
 
 import numpy as np
-import pyvista
-from matplotlib import pyplot as plt
-from scipy.optimize import fmin, fmin_powell, brute
 
-from .geometric import SphereMappedSources, toMesh
 from .cov import compute_whitener, _ensure_cov
 from .io.constants import FIFF
 from .io.pick import pick_types
@@ -849,9 +844,9 @@ def _fit_eval(rd, B, B2, fwd_svd=None, fwd_data=None, whitener=None,
 def _fit_eval_polar(rd, B, B2, fwd_svd=None, fwd_data=None, whitener=None,
                     lwork=None):
     """Calculate the residual sum of squares from spheric coordinates."""
-    from .geometric import carthesian
-    src_sph: SphereMappedSources = fwd_data['src_sph']
-    rd = src_sph.transform(rd)  # go to mesh/HEAD frame for the forward.
+    if fwd_svd is None:
+        sph = fwd_data['src_sph']
+        rd = sph.transform(rd)
     return _fit_eval(rd, B, B2, fwd_svd=fwd_svd, fwd_data=fwd_data, whitener=whitener, lwork=lwork)
 
 
@@ -1108,6 +1103,10 @@ def _sphere_constraint(rd, r0, R_adj):
     """Sphere fitting constraint."""
     return R_adj - np.sqrt(np.sum((rd - r0) ** 2))
 
+def _sphere_surface_constraint(rd, r0, R_adj):
+    """equality constraint as two inequality for cobyla."""
+    dist = R_adj - np.linalg.norm((rd -r0))
+    return np.r_[dist, -dist]
 
 def _fit_dipole(min_dist_to_inner_skull, B_orig, t, guess_rrs,
                 guess_data, fwd_data, whitener, fmin_cobyla, ori, rank,
@@ -1116,21 +1115,25 @@ def _fit_dipole(min_dist_to_inner_skull, B_orig, t, guess_rrs,
     B = np.dot(whitener, B_orig)
 
     # make constraint function to keep the solver within the inner skull
-    if 'rr' in fwd_data['inner_skull']:  # bem
+    
+    sph = fwd_data.get('src_sph')
+    if sph is not None:  # sphere mapping model
+        fit_fun = _fit_eval_polar
+        surf = None
+        constraint = partial(_sphere_surface_constraint, r0=sph.center, R_adj=sph.radius)
+        constraint = None
+    elif 'rr' in fwd_data['inner_skull']:  # bem
+        fit_fun = _fit_eval
         surf = fwd_data['inner_skull']
         constraint = partial(_surface_constraint, surf=surf,
                              min_dist_to_inner_skull=min_dist_to_inner_skull)
-
     else:  # sphere
+        fit_fun = _fit_eval
         surf = None
         constraint = partial(
             _sphere_constraint, r0=fwd_data['inner_skull']['r0'],
             R_adj=fwd_data['inner_skull']['R'] - min_dist_to_inner_skull)
 
-    if 'src_sph' in fwd_data:  # sphere mapping model
-        logger.info("using sphere model.")
-        constraint = None
-        surf = None
 
     # Find a good starting point (find_best_guess in C)
     B2 = np.dot(B, B)
@@ -1141,45 +1144,34 @@ def _fit_dipole(min_dist_to_inner_skull, B_orig, t, guess_rrs,
     lwork = _svd_lwork((3, B.shape[0]))
 
 
-    if 'src_sph' in fwd_data:
-        sphere_mapping = fwd_data['src_sph']
-        fun = partial(_fit_eval_polar, B=B, B2=B2, fwd_data=fwd_data, whitener=whitener, lwork=lwork)
-        head_mri = np.linalg.inv(fwd_data["mri_head_t"]['trans'])
 
-        visual_debug = False
-        if visual_debug:
-            #visual check that the cortical surface is correctly positioned inside the brain surface.
-            cortical_mesh = toMesh(sphere_mapping['rr'], sphere_mapping['tri'])
-            inner_suf_mesh = toMesh(fwd_data['inner_skull']['rr'], fwd_data['inner_skull']['tris'])
-            combined = cortical_mesh + inner_suf_mesh
-            plotter = pyvista.Plotter()
-            plotter.add_mesh(combined, opacity=0.4)
-
-            grid = np.mgrid[0:np.pi:10j, -np.pi:np.pi:10j].reshape((2,-1)).T
-            rd = np.array([sphere_mapping.transform(x) for x in grid])
-            plotter.add_points(rd, color="red",)
-            plotter.show()
-
-        rd_final = brute(fun, ((0, np.pi), (-np.pi, np.pi)), Ns=10, finish=fmin, workers=1)
-        rd_final = sphere_mapping.transform(rd_final)
+    idx = np.argmin([fit_fun(guess_rrs[[fi], :], B, B2, fwd_svd)
+                        for fi, fwd_svd in enumerate(guess_data['fwd_svd'])])
+    x0 = guess_rrs[idx]
+    fun = partial(fit_fun, B=B, B2=B2, fwd_data=fwd_data, whitener=whitener,
+                    lwork=lwork)
 
 
-    else:  # solving using the sphere mapping.
-
-        idx = np.argmin([_fit_eval(guess_rrs[[fi], :], B, B2, fwd_svd)
-                         for fi, fwd_svd in enumerate(guess_data['fwd_svd'])])
-        x0 = guess_rrs[idx]
-
-        fun = partial(_fit_eval, B=B, B2=B2, fwd_data=fwd_data, whitener=whitener,
-                      lwork=lwork)
-
-        # Tested minimizers:
-        #    Simplex, BFGS, CG, COBYLA, L-BFGS-B, Powell, SLSQP, TNC
-        # Several were similar, but COBYLA won for having a handy constraint
-        # function we can use to ensure we stay inside the inner skull /
-        # smallest sphere
+    
+    # Tested minimizers:
+    #    Simplex, BFGS, CG, COBYLA, L-BFGS-B, Powell, SLSQP, TNC
+    # Several were similar, but COBYLA won for having a handy constraint
+    # function we can use to ensure we stay inside the inner skull /
+    # smallest sphere
+    if False and sph is not None and sph.project:
+        logger.debug(f"using BFGS and projections onto the sphere.")
+        #from scipy.optimize import minimize
+        #optiResult = minimize(fun, x0, method='Nelder-Mead',tol=rhoend, options=dict(disp=True))
+        #rd_final = sph.transform(optiResult.x)
+        rd_final = sph.transform(x0)
+    else:
         rd_final = fmin_cobyla(fun, x0, (constraint,), consargs=(),
-                               rhobeg=5e-2, rhoend=rhoend, disp=True)
+                           rhobeg=5e-2, rhoend=rhoend, disp=True)
+        #rd_final = x0
+    
+
+
+
 
     # simplex = _make_tetra_simplex() + x0
     # _simplex_minimize(simplex, 1e-4, 2e-4, fun)
@@ -1237,7 +1229,9 @@ def _fit_dipole_fixed(min_dist_to_inner_skull, B_orig, t, guess_rrs,
 def fit_dipole(evoked, cov, bem, trans=None, min_dist=5., n_jobs=None,
                pos=None, ori=None, rank=None, accuracy='normal', tol=5e-5,
                verbose=None,
-               src_sph=None):
+               src_sph=None,
+               n_grid=150,
+               rng=None):
     """Fit a dipole.
 
     Parameters
@@ -1291,7 +1285,8 @@ def fit_dipole(evoked, cov, bem, trans=None, min_dist=5., n_jobs=None,
         .. versionadded:: 0.24
     %(verbose)s
 
-    src_sph : SphereMappedSources | None. If SphereMappedSources, use angular optimization with surface interpolation.
+    src_sph : SphereWhite
+    n_grid: Brute force grid size. (only used if src_sph is given.)
 
     Returns
     -------
@@ -1344,11 +1339,13 @@ def fit_dipole(evoked, cov, bem, trans=None, min_dist=5., n_jobs=None,
     # Figure out our inputs
     neeg = len(pick_types(info, meg=False, eeg=True, ref_meg=False,
                           exclude=[]))
+    
     if isinstance(bem, str):
         bem_extra = bem
     else:
         bem_extra = repr(bem)
         logger.info('BEM               : %s' % bem_extra)
+    
     mri_head_t, trans = _get_trans(trans)
     logger.info('MRI transform     : %s' % trans)
     bem = _setup_bem(bem, bem_extra, neeg, mri_head_t, verbose=False)
@@ -1473,14 +1470,15 @@ def fit_dipole(evoked, cov, bem, trans=None, min_dist=5., n_jobs=None,
         guess_src = dict(nuse=1, rr=pos[np.newaxis], inuse=np.array([True]))
         logger.info('Compute forward for dipole location...')
     elif src_sph is not None:
-        transform_surface_to(src_sph, 'head', mri_head_t)
-        logger.info('\n---- Computing the forward solution for the guesses...')
         from numpy.random import default_rng
-        rng = default_rng()
-        grid = rng.standard_normal((200, 3))
-        inv_norm = 0.1 / np.linalg.norm(grid, axis=1)
-        rr = (np.einsum("ij,i->ij", grid, inv_norm))
-        guess_src = dict(rr=rr, type='discrete', nuse=len(rr), coord_frame=src_sph['coord_frame'], vertno=np.arange(len(rr)))
+        rng = rng or default_rng(17)
+        grid = rng.standard_normal((n_grid, 3))
+        inv_norm = 1.0 /  np.linalg.norm(grid, axis=1)
+        transform_surface_to(src_sph, 'head', mri_head_t)
+        sphere_rr = (np.einsum("ij,i->ij", grid, inv_norm))
+        #cortical_rr = np.vectorize(src_sph.transform, signature="(m)->(n)")(sphere_rr)
+        guess_src = dict(rr=sphere_rr, type='discrete', nuse=len(sphere_rr), coord_frame=src_sph['coord_frame'], vertno=np.arange(len(sphere_rr)))
+        logger.info("guess grid set on spherical surface.")
 
     else:
         logger.info('\n---- Computing the forward solution for the guesses...')
@@ -1489,7 +1487,6 @@ def fit_dipole(evoked, cov, bem, trans=None, min_dist=5., n_jobs=None,
         # grid coordinates go from mri to head frame
         transform_surface_to(guess_src, 'head', mri_head_t)
         logger.info('Go through all guess source locations...')
-
 
 
     # inner_skull goes from mri to head frame
@@ -1513,14 +1510,21 @@ def fit_dipole(evoked, cov, bem, trans=None, min_dist=5., n_jobs=None,
                     inner_skull=inner_skull)
 
     if src_sph is not None:
+        # if using the sphere mapping, guess_src is in the sphere and must be mapped to the cortical data first.
         fwd_data['src_sph'] = src_sph
-        fwd_data['mri_head_t'] = mri_head_t
-
-    # fwd_data['inner_skull'] in head frame, bem in mri, confusing...
-    _prep_field_computation(guess_src['rr'], bem, fwd_data, n_jobs,
-                            verbose=False)
-    guess_fwd, guess_fwd_orig, guess_fwd_scales = _dipole_forwards(
-        fwd_data, whitener, guess_src['rr'], n_jobs=fit_n_jobs)
+        cortical_rr = np.vectorize(src_sph.transform, signature="(m)->(n)")(guess_src['rr'])
+        _prep_field_computation(cortical_rr, bem, fwd_data, n_jobs,
+                                verbose=False)
+        guess_fwd, guess_fwd_orig, guess_fwd_scales = _dipole_forwards(
+            fwd_data, whitener, cortical_rr, n_jobs=fit_n_jobs)
+    else:
+        
+        # fwd_data['inner_skull'] in head frame, bem in mri, confusing...
+        _prep_field_computation(guess_src['rr'], bem, fwd_data, n_jobs,
+                                verbose=False)
+        guess_fwd, guess_fwd_orig, guess_fwd_scales = _dipole_forwards(
+            fwd_data, whitener, guess_src['rr'], n_jobs=fit_n_jobs)
+        
     # decompose ahead of time
     guess_fwd_svd = [linalg.svd(fwd, full_matrices=False)
                      for fwd in np.array_split(guess_fwd,
