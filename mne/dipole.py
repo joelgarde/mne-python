@@ -1158,12 +1158,12 @@ def _fit_dipole(min_dist_to_inner_skull, B_orig, t, guess_rrs,
     # Several were similar, but COBYLA won for having a handy constraint
     # function we can use to ensure we stay inside the inner skull /
     # smallest sphere
-    if False and sph is not None and sph.project:
+    if  sph is not None and sph.project:
         logger.debug(f"using BFGS and projections onto the sphere.")
-        #from scipy.optimize import minimize
-        #optiResult = minimize(fun, x0, method='Nelder-Mead',tol=rhoend, options=dict(disp=True))
-        #rd_final = sph.transform(optiResult.x)
-        rd_final = sph.transform(x0)
+        from scipy.optimize import minimize
+        optiResult = minimize(fun, x0, method='Nelder-Mead',tol=rhoend, options=dict(disp=True))
+        rd_final = sph.transform(optiResult.x)
+        #rd_final = sph.transform(x0)
     else:
         rd_final = fmin_cobyla(fun, x0, (constraint,), consargs=(),
                            rhobeg=5e-2, rhoend=rhoend, disp=True)
