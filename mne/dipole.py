@@ -1121,7 +1121,6 @@ def _fit_dipole(min_dist_to_inner_skull, B_orig, t, guess_rrs,
         fit_fun = _fit_eval_polar
         surf = None
         constraint = partial(_sphere_surface_constraint, r0=sph.center, R_adj=sph.radius)
-        constraint = None
     elif 'rr' in fwd_data['inner_skull']:  # bem
         fit_fun = _fit_eval
         surf = fwd_data['inner_skull']
@@ -1147,6 +1146,7 @@ def _fit_dipole(min_dist_to_inner_skull, B_orig, t, guess_rrs,
 
     idx = np.argmin([fit_fun(guess_rrs[[fi], :], B, B2, fwd_svd)
                         for fi, fwd_svd in enumerate(guess_data['fwd_svd'])])
+    
     x0 = guess_rrs[idx]
     fun = partial(fit_fun, B=B, B2=B2, fwd_data=fwd_data, whitener=whitener,
                     lwork=lwork)
@@ -1161,12 +1161,12 @@ def _fit_dipole(min_dist_to_inner_skull, B_orig, t, guess_rrs,
     if  sph is not None and sph.project:
         logger.debug(f"using BFGS and projections onto the sphere.")
         from scipy.optimize import minimize
-        optiResult = minimize(fun, x0, method='Nelder-Mead',tol=rhoend, options=dict(disp=True))
+        optiResult = minimize(fun, x0, method='Nelder-Mead',tol=rhoend, options=dict(disp=True, ))
         rd_final = sph.transform(optiResult.x)
         #rd_final = sph.transform(x0)
     else:
         rd_final = fmin_cobyla(fun, x0, (constraint,), consargs=(),
-                           rhobeg=5e-2, rhoend=rhoend, disp=True)
+                           rhobeg=5e-2, rhoend=rhoend, disp=True, callback=print)
         #rd_final = x0
     
 

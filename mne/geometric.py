@@ -113,7 +113,6 @@ class SphereWhite(dict):
         """ from sphere point to cortical point.
         """
         rd = np.atleast_2d(rd)
-        print(rd)
         if self.project:
             rd = rd / np.linalg.norm(rd, axis=1).item()
         leaf = self.tree.query(rd, k=25, sort_results=False, return_distance=False)
@@ -123,6 +122,7 @@ class SphereWhite(dict):
         idx = tri_leaf[intersected_tri]
         tri = self[on][self["tris"][idx]]
         rd = np.einsum("ij,i->j", tri, barycentric_coordinates)
+        print(rd)
         return rd
 
 
