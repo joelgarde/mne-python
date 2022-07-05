@@ -54,7 +54,7 @@ def find_tri(X: ArrayLike, rr: ArrayLike, tri: ArrayLike):
     m: intersected triangle index.
     t: (3,) coords of the intersection in in i's barycentric system.
     """
-
+    EPS = 1e-7
     # Solve the barycentric system.
     X = np.ravel(X)
     A = rr[tri]
@@ -67,8 +67,8 @@ def find_tri(X: ArrayLike, rr: ArrayLike, tri: ArrayLike):
     idet = np.reciprocal(det)
     u = np.einsum("ij,ij,i->i", T, P, idet)
     v = np.einsum("j,ij,i->i", X, Q, idet)
-    cull = (v >= 0) & (u >= 0) & (u + v <= 1)
-    m = np.flatnonzero(cull).item()
+    cull = (v >= -EPS) & (u >= -EPS) & (u + v <= (1+EPS))
+    m = np.flatnonzero(cull)[0] # nota: there should be only 1 item. (multiple can be found in the rare case where we are exactly on a point and thus belong to multiple triangles.)
     v = v[m]
     u = u[m]
     t = np.asarray([u, v, 1 - u - v])
@@ -91,6 +91,7 @@ class SphereWhite(dict):
         surf_path = Path(data_path()) / 'subjects' / 'sample' / 'surf'
         white = _read_mri_surface(surf_path / f'{hemishpere}.white')
         sphere = _read_mri_surface(surf_path / f'{hemishpere}.sphere')
+        
         self |= white
 
         radius, origin = _fit_sphere(sphere['rr'])
