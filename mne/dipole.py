@@ -1483,7 +1483,7 @@ def fit_dipole(evoked, cov, bem, trans=None, min_dist=5., n_jobs=None,
     else:
         logger.info('\n---- Computing the forward solution for the guesses...')
         guess_src = _make_guesses(inner_skull, guess_grid, guess_exclude,
-                                  guess_mindist, n_jobs=n_jobs)[0]
+                                  guess_mindist, n_jobs=1)[0]
         # grid coordinates go from mri to head frame
         transform_surface_to(guess_src, 'head', mri_head_t)
         logger.info('Go through all guess source locations...')
@@ -1513,14 +1513,14 @@ def fit_dipole(evoked, cov, bem, trans=None, min_dist=5., n_jobs=None,
         # if using the sphere mapping, guess_src is in the sphere and must be mapped to the cortical data first.
         fwd_data['src_sph'] = src_sph
         cortical_rr = np.vectorize(src_sph.transform, signature="(m)->(n)")(guess_src['rr'])
-        _prep_field_computation(cortical_rr, bem, fwd_data, n_jobs,
+        _prep_field_computation(cortical_rr, bem, fwd_data, n_jobs=1,
                                 verbose=False)
         guess_fwd, guess_fwd_orig, guess_fwd_scales = _dipole_forwards(
             fwd_data, whitener, cortical_rr, n_jobs=fit_n_jobs)
     else:
         
         # fwd_data['inner_skull'] in head frame, bem in mri, confusing...
-        _prep_field_computation(guess_src['rr'], bem, fwd_data, n_jobs,
+        _prep_field_computation(guess_src['rr'], bem, fwd_data, n_jobs=1,
                                 verbose=False)
         guess_fwd, guess_fwd_orig, guess_fwd_scales = _dipole_forwards(
             fwd_data, whitener, guess_src['rr'], n_jobs=fit_n_jobs)
